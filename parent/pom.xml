@@ -25,7 +25,7 @@
         <jakarta.validation.api.version>3.0.2</jakarta.validation.api.version>
         <jakarta.persistence.api.version>3.1.0</jakarta.persistence.api.version>
         <swagger.annotations.version>2.2.7</swagger.annotations.version>
-        <lombok.version>1.18.20</lombok.version>
+        <lombok.version>1.18.30</lombok.version>
         <modelmapper.version>2.4.2</modelmapper.version>
         <redis.clients.version>3.6.0</redis.clients.version>
         <java.queues>2.7</java.queues>

@@ -152,13 +152,62 @@ Role-based field access control.
 private BigDecimal salary;
 ```
 
-##### `@FillerProperty`
-Post-processing enrichment using Spring beans.
+##### `@FillerProperty` (View Enrichment)
+Used by `FillerResolver` to populate fields **after** the initial view transformation. This effectively decouples the View transformation from external data fetching, enabling efficient **Cross-Microservice Composition**.
+
+**Use Cases:**
+- Hydrating a View with data from another microservice (e.g., populating `UserView` in `OrderView`).
+- Bulk loading data to avoid N+1 queries.
+- Merging data from different data sources (e.g., SQL + Mongo).
 
 ```java
-@FillerProperty(value = "priceCalculator")
-private BigDecimal calculatedPrice;
+// 1. View Definition
+public class OrderView implements View {
+    private String userId; // Stored as String, but IDs must be Integer for FillerResolver
+    
+    // Configures the field to be filled by the "user-service-fetcher" function
+    // using "userId" as the key.
+    @FillerProperty(fillerFunctionName = "user-service-fetcher", supplier = "userId")
+    private UserView userDetails;
+    
+    public String getUserId() { return this.userId; }
+}
+
+// 2. Define the Filler Function (e.g., in a @Configuration class)
+public FillerFunction<OrderView, UserView> createUserFillerFunction(UserClient userClient) {
+    final FillerFunction<OrderView, UserView> filler = new FillerFunction<>();
+    filler.setFunctionName("user-service-fetcher");
+    
+    // A. Define how to extract the ID from the source (OrderView)
+    // Note: SupplierId expects Function<View, Integer>
+    filler.setSuppliersId(List.of(
+        new SupplierId<>(view -> Integer.parseInt(view.getUserId()), "userId")
+    ));
+    
+    // B. Define how to match the result back (extract ID from UserView)
+    filler.setResponsesId(UserView::getId);
+    
+    // C. Define the Bulk Fetch Logic (Batch API Call)
+    // Input: Collection<Integer> ids -> Output: Collection<UserView>
+    filler.setFillerFunction(ids -> userClient.getUsersByIds(ids));
+    
+    return filler;
+}
+
+// 3. Usage in Business Logic
+List<OrderView> orders = viewMapper.map(orderEntities, OrderView.class);
+
+// Create or inject the list of functions
+List<FillerFunction<?, ?>> fillers = List.of(this.createUserFillerFunction(userClient));
+
+// Bulk fetch user details for ALL orders in one go
+FillerResolver.resolve(orders, fillers);
 ```
+
+**Key Components:**
+- **`FillerResolver`**: The engine that coordinates the enrichment.
+- **`FillerFunction`**: Defines the bulk fetching logic (IDs -> Views).
+- **`FillerProperty`**: Links the View field to a specific `FillerFunction`.
 
 ##### `@DataAdapter`
 Custom data transformation during view resolution.
@@ -324,62 +373,52 @@ public class MyService {
     
     @Autowired
     private RedisService redisService;
+
+    @Autowired
+    private RedisConnectionManager redisConnectionManager;
     
-    // Store object
-    redisService.set(redisCommands, "user:123", userObject, 3600);
-    
-    // Retrieve object
-    User user = this.redisService.get(redisCommands, "user:123", User.class);
-    
-    // Delete
-    redisService.delete(redisCommands, "user:123");
+    public void processUser(User userObject) {
+        final RedisCommands redisCommands = this.redisConnectionManager.getConnection();
+        try {
+            // Store object
+            this.redisService.set(redisCommands, "user:123", userObject, 3600);
+            
+            // Retrieve object
+            final User user = this.redisService.get(redisCommands, "user:123", User.class);
+            
+            // Delete
+            this.redisService.delete(redisCommands, "user:123");
+        } finally {
+            this.redisConnectionManager.closeConnection(redisCommands);
+        }
+    }
 }
 ```
 
 ##### 2. **Hash Operations**
 
 ```java
-// Store hash
-Map<String, String> userData = Map.of(
-    "name", "John",
-    "email", "john@example.com"
-);
-redisService.setHash(redisCommands, "user:123", userData);
+RedisCommands redisCommands = redisConnectionManager.getConnection();
 
-// Get single field
-String email = redisService.getHashField(redisCommands, "user:123", "email");
+try {
+    // Store hash
+    Map<String, String> userData = Map.of(
+        "name", "John",
+        "email", "john@example.com"
+    );
+    redisService.setHash(redisCommands, "user:123", userData);
 
-// Get all fields
-Map<String, String> allData = redisService.getHash(redisCommands, "user:123");
-```
+    // Get single field
+    String email = redisService.getHashField(this.redisCommands, "user:123", "email");
 
-##### 3. **Redis Units**
-
-**Pattern for managing complex hierarchical data structures.**
-
-```java
-// Define key structure
-public class OrderKey implements RedisUnitKey {
-    private String orderId;
-    
-    @Override
-    public String getKey() {
-        return "order:" + this.orderId;
-    }
-}
-
-// Define unit structure
-public class OrderItemUnit implements RedisUnit<OrderItemKey> {
-    private OrderItemKey key;
-    private String productId;
-    private Integer quantity;
-    
-    @Override
-    public OrderItemKey getKey() {
-        return this.key;
-    }
+    // Get all fields
+    Map<String, String> allData = redisService.getHash(this.redisCommands, "user:123");
+} finally {
+    redisConnectionManager.closeConnection(redisCommands);
 }
 ```
+
+
 
 #### Distributed Locking:
 
@@ -396,29 +435,176 @@ try {
 }
 ```
 
-#### Functional API:
+#### Functional API (Bulk Operations Strategy)
+
+The framework uses a functional strategy pattern for handling complex bulk operations (get, set, update) efficiently on **Key-Value** pairs.
+
+**1. Implement `GetFunctions` for Read Operations:**
 
 ```java
-// GetFunctions - Read transformations
-String value = redisService.execute(
-    redisCommands,
-    GetFunctions.getAndTransform("user:123", User.class)
-        .andThen(user -> user.getEmail())
-        .andThen(String::toUpperCase)
-);
+public class OrderGetFunctions implements GetFunctions<OrderKey, OrderValue, OrderKeyValue> {
+    
+    private final JsonConverter<OrderValue> converter = new JsonConverter<>(OrderValue.class);
 
-// SetFunctions - Write transformations
-redisService.execute(
-    redisCommands,
-    SetFunctions.transformAndSet(
-        "user:123",
-        user -> {
-            user.setLastLogin(LocalDateTime.now());
-            return user;
-        },
-        3600
-    )
-);
+    @Override
+    public ToValueFunction<OrderKey, OrderValue> toValueFunction() {
+        return (key, rawJson) -> rawJson != null ? this.converter.toObject(rawJson) : null;
+    }
+
+    @Override
+    public ToKeyValueFunction<OrderKey, OrderValue, OrderKeyValue> toKeyValueFunction() {
+        return (key, value) -> new OrderKeyValue(key, value);
+    }
+}
+```
+
+**2. Implement `SetFunctions` for Write Operations:**
+
+```java
+public class OrderSetFunctions implements SetFunctions<OrderKey, OrderValue, OrderKeyValue> {
+
+    private final Collection<OrderUpdateData> updates;
+
+    public OrderSetFunctions(Collection<OrderUpdateData> updates) {
+        this.updates = updates;
+    }
+
+    @Override
+    public UpdateValueFunction<OrderKey, OrderValue> updateValueFunction() {
+        return (key, currentOrder) -> {
+            // Business logic to update the order
+            findUpdate(key).ifPresent(update -> currentOrder.setStatus(update.getStatus()));
+            return currentOrder;
+        };
+    }
+
+    @Override
+    public NewValueFunction<OrderKey, OrderValue> newValueFunction() {
+        return (key) -> {
+             // Logic to create a new order if not found
+             return new OrderValue(findUpdate(key).orElse(null));
+        };
+    }
+    
+    // ... implement other methods
+}
+```
+
+**3. Usage:**
+
+```java
+@Autowired
+private RedisService<OrderKey, OrderValue, OrderKeyValue> redisService;
+
+public void processOrders(List<String> orderIds) {
+    final List<OrderKey> keys = orderIds.stream().map(OrderKey::new).toList();
+    
+    // Bulk read
+    final Collection<OrderKeyValue> orders = this.redisService.getKeyValues(keys, new OrderGetFunctions());
+    
+    // Bulk update/insert
+    this.redisService.setKeyValues(keys, new OrderSetFunctions(incomingUpdates));
+}
+```
+
+#### 🔴 Redis Units (Advanced Hash Management)
+
+**Location:** `parent/redis/`
+
+`RedisUnitService` simplifies managing hierarchical data where a **Container** (e.g., Order) holds a collection of **Units** (e.g., OrderItems) stored as a Redis **Hash**.
+- **Redis Key**: The Container ID (`OrderKey`).
+- **Hash Field**: The Unit Key (`OrderItemKey`).
+- **Hash Value**: The Unit Data (`OrderItem`).
+
+**1. Define the Structure:**
+
+```java
+// 1. Container Key (The Redis Key)
+public class OrderKey implements RedisKey {
+    private String id;
+    @Override public String getKey() { return "order:" + this.id; }
+}
+
+// 2. Unit Key (The Hash Field)
+public class OrderItemKey implements RedisUnitKey {
+    private String sku;
+    @Override public String getKey() { return this.sku; } // Unique within the container
+}
+
+// 3. Unit (The data stored in Hash Value)
+public class OrderItem implements RedisUnit<OrderItemKey> {
+    private OrderItemKey key;
+    private int quantity;
+    @Override public OrderItemKey getKey() { return this.key; }
+}
+
+// 4. Container (The Object representing the whole structure)
+public class Order implements RedisUnitContainer<OrderKey, OrderItem> {
+    private OrderKey key;
+    private Collection<OrderItem> items;
+    // ... getters/setters/constructor
+    @Override public OrderKey getRedisKey() { return this.key; }
+    @Override public Collection<OrderItem> getRedisUnits() { return this.items; }
+}
+```
+
+**2. Usage (`RedisUnitService`):**
+
+```java
+@Autowired
+private RedisUnitService<OrderKey, OrderItemKey, OrderItem, Order> redisUnitService;
+
+public void manageOrderItems() {
+    final List<OrderKey> keys = List.of(new OrderKey("ORD-1"));
+
+    // READ: Get Orders with their Items
+    // Requires: Mapping Function (Hash Map -> Units) + Creation Function (Units -> Container)
+    final Collection<Order> orders = this.redisUnitService.getRedisUnitContainers(
+        keys, 
+        RedisFunctions.mappingUnitFunction(), 
+        RedisFunctions.redisUnitContainerCreationFunction(), 
+        item -> item.getQuantity() > 0 // Optional: Filter units
+    );
+
+    // WRITE: Save Orders and their Items
+    // Requires: Mapping Attribute Function (Units -> Hash Map) + Merger Function
+    this.redisUnitService.setRedisUnitContainers(
+        orders,
+        RedisFunctions.mappingUnitFunction(),       // Map -> Unit
+        RedisFunctions.mappingAttributeFunction(),  // Unit -> Map
+        RedisFunctions.mergerUnitFunction(),        // Merge Strategy
+        RedisFunctions.redisUnitContainerCreationFunction()
+    );
+}
+```
+
+**3. Required Functions Helper:**
+
+You need to implement the translation functions. Typically encapsulated in a utility class:
+
+```java
+public class RedisFunctions {
+    // Defines how to convert Redis Hash Data (Map<String, String>) to Unit Objects
+    public static MappingUnitFunction<OrderKey, OrderItemKey, OrderItem> mappingUnitFunction() {
+        return (redisKeyMapValues) -> {
+            // logic to convert map values to Set<OrderItem>
+            return redisKeyMapValues.getValues().values().stream()
+                .map(json -> jsonConverter.toObject(json))
+                .collect(Collectors.toSet());
+        };
+    }
+    
+    // Defines how to convert Unit Objects to Redis Hash Data
+    public static MappingAttributeFunction<OrderKey, OrderItemKey, OrderItem> mappingAttributeFunction() {
+        return (key, units) -> {
+            final Map<String, String> map = units.stream()
+                .collect(Collectors.toMap(u -> u.getKey().getKey(), u -> jsonConverter.toString(u)));
+            return new RedisKeyMapValues<>(key, map);
+        };
+    }
+    
+    // ... implement mergerUnitFunction and redisUnitContainerCreationFunction
+}
 ```
 
 ---
@@ -513,14 +699,11 @@ long count(OrderSearch searchCriteria);
 #### Configuration:
 
 ```java
-@RedisCacheConfiguration(
-    cacheName = "users",
-    ttl = 3600  // 1 hour TTL
-)
 @Service
 public class UserService {
     
     @Cacheable(value = "users", key = "#userId")
+    @RedisCacheConfiguration(ttl = 3600) // 1 hour TTL
     public User getUserById(String userId) {
         return userRepository.findById(userId);
     }
@@ -564,20 +747,38 @@ public class CacheController {
 
 #### 1. Error Recovery System
 
-**Automatic retry mechanism** for failed operations with exponential backoff.
+**Recovery mechanism** for failed operations. Errors are registered in an external service, and a background task polls for pending errors to trigger the recovery logic.
 
 ```java
 @Service
-public class OrderService {
+@ErrorRecovery(maxRetries = "3", fixedDelayMilis = "5000")
+public class OrderService implements Recoverable {
     
-    @Recoverable(
-        maxRetries = 3,
-        backoffMs = 1000,
-        jmsQueue = "error.recovery.queue"
-    )
+    @Autowired
+    private ErrorRegister errorRegister;
+    
     public void processOrder(Order order) {
-        // If this fails, it will be retried automatically
-        externalPaymentService.charge(order);
+        try {
+            // Business logic that might fail
+            paymentGateway.charge(order);
+        } catch (final Exception ex) {
+            // Register error for later recovery
+            this.errorRegister.registryErrorAsync(
+                ex,
+                "processOrder", 
+                this.getClass().getName(), // Class name matches the bean for recovery
+                Map.of("orderId", order.getId()), 
+                true
+            );
+        }
+    }
+
+    @Override
+    public void recover(ErrorView errorView) {
+        // Recovery logic executed by the background task
+        final String orderId = errorView.getData().get("orderId");
+        final Order order = orderRepository.findById(orderId);
+        this.processOrder(order); 
     }
 }
 ```
@@ -601,26 +802,42 @@ public class RequestTrackerFilter implements Filter {
 
 #### 3. JMS/RabbitMQ Integration
 
-**Message-driven architecture** with automatic context propagation.
+**Integration with `rabbitmq-java-queue`** for message-driven architecture.
+
+The framework leverages the separate **`rabbitmq-java-queue`** library to provide robust messaging capabilities. Within `spring-base`, this is primarily used for:
+
+1.  **Error Reporting:** Automatically sending exceptions to an error queue via `ErrorRegister`.
+2.  **Event Propagation:** Publishing business events using producers like `EventProducerResource`.
+
+**Example 1: Event Producer**
 
 ```java
 @Component
-@JmsListener(value = OrderCreatedConsumer.class)
-public class OrderCreatedConsumer implements JmsResourceListener {
-    
+@JmsProducer
+@NotifyErrorHandler
+@JmsDestination(name = "event-queue", clazzSuffix = JmsActiveProfileSuffix.class)
+public class EventProducerResource extends JmsProducerResource<EventRequest> {
+    // Methods to publish events are inherited from JmsProducerResource (e.g., send(event))
+}
+```
+
+**Example 2: Error Reporting (Internal)**
+
+The `ErrorRegister` component uses an internal producer (`JmsErrorProducer`) to send error details to the configured error queue.
+
+```java
+@Component
+public class ErrorRegister {
+
     @Autowired
-    private OrderService orderService;
-    
-    @Override
-    public void onProcessingMessage(Message message) {
-        final OrderCreatedEvent event = fromJson(message);
-        this.orderService.processNewOrder(event.getOrderId());
-    }
-    
-    @Override
-    @NotifyErrorHandler(jmsQueue = "error.queue")
-    public void onErrorMessage(Message message, Exception ex) {
-        // Automatic error handling and DLQ
+    private JmsErrorProducer jmsErrorProducer;
+
+    public void registryError(Throwable exception, Map<String, String> data) {
+        // Sends error details to the DLQ/Error Queue
+        this.jmsErrorProducer.send(ErrorRequest.builder()
+            .errorMessage(exception.getMessage())
+            .data(data)
+            .build());
     }
 }
 ```
@@ -677,6 +894,17 @@ public class ConfigService {
     }
 }
 ```
+
+#### 7. Management Controllers
+
+Operational endpoints for controlling application state at runtime.
+
+| Controller | Base Path | Description |
+|------------|-----------|-------------|
+| **JmsController** | `/jms` | Manage JMS consumers (start, stop, list). Useful for operating on specific consumers without restart. |
+| **BeanController** | `/bean` | Refresh beans annotated with `@Scope("refreshable-singleton")` via `/bean/refresh?name={beanName}`. |
+| **ErrorRecoveryController** | `/errorRecovery` | Manually trigger the error recovery process based on provided search criteria. |
+| **CommonsController** | N/A | Base controller providing standardized `@ExceptionHandler` responses for `NotFoundException`, `BadRequest`, etc. |
 
 ---
 
@@ -740,36 +968,37 @@ public class AuditInfo {
 ## 🎯 Key Features
 
 ### ✅ **Dynamic Querying**
-- **MongoDB**: Annotation-driven aggregation pipelines
-- **JPA/Hibernate**: Dynamic HQL generation
-- **Type-safe**: Compile-time validation with annotations
+- **MongoDB**: Annotation-driven aggregation pipelines with support for **Geospatial search**, computed fields (`$multiply`, etc.), and field concatenation.
+- **JPA/Hibernate**: Dynamic HQL generation with automatic Join handling.
+- **Advanced Filtering**: Support for `IS`, `LIKE`, `IN`, `GTE`, `LTE`, `EXISTS` and nested criteria.
 
-### ✅ **View Transformation**
-- **Annotation-based**: Minimal boilerplate
-- **Security-aware**: Role-based field filtering
-- **Lazy-loading safe**: Hibernate proxy handling
-- **Polymorphic**: Runtime type resolution
+### ✅ **View Transformation & Composition**
+- **Cross-Microservice Composition**: Hydrate views with data from external services using `FillerResolver`.
+- **Annotation-based**: Minimal boilerplate for Model-to-DTO mapping.
+- **Security-aware**: Role-based field filtering (`@PropertyRolesAllowed`).
+- **Lazy-loading safe**: Intelligent Hibernate proxy handling to avoid N+1 and initialization exceptions.
+- **Polymorphic**: Runtime type resolution for inheritance hierarchies.
 
-### ✅ **Redis Abstraction**
-- **High-level API**: Transparent data structure management
-- **Functional style**: Elegant transformation pipelines
-- **Distributed locking**: Mutex and lock support
-- **Reactive support**: Non-blocking operations
+### ✅ **Redis Ecosystem**
+- **Hierarchical Data**: Manage complex "Container-Unit" structures (e.g., Orders -> Items) with `RedisUnitService`.
+- **Functional Strategies**: Type-safe `GetFunctions`/`SetFunctions` for efficient bulk operations.
+- **Distributed Locking**: Robust mutex implementation for cluster-safe operations.
+- **Reactive Support**: Fully non-blocking implementations for high-throughput scenarios.
 
-### ✅ **Error Recovery**
-- **Automatic retries**: Exponential backoff
-- **Error tracking**: Searchable error registry
-- **Manual intervention**: Admin recovery endpoints
+### ✅ **Resilience & Recovery**
+- **Error Recovery System**: Interface-based (`Recoverable`) scheduled recovery for failed operations.
+- **Message-Driven Architecture**: Integration with `rabbitmq-java-queue` for robust Event-Driven patterns.
+- **Automatic Error Reporting**: Seamless integration with error queues and DLQ strategies.
 
-### ✅ **Request Tracking**
-- **Distributed tracing**: Request ID propagation
-- **Context management**: Thread-local storage
-- **JMS integration**: Context propagation across messages
+### ✅ **Application Operations**
+- **Refreshable Scope**: Custom `@Scope("refreshable-singleton")` for runtime bean reloading without restart.
+- **Management Endpoints**: Built-in controllers for managing JMS consumers, clearing caches, and triggering manual recovery.
+- **Cache Management**: Method-level TTL configuration (`@RedisCacheConfiguration`) and runtime statistics.
+- **Request Tracing**: Distributed tracing with Request ID propagation across HTTP and JMS borders.
 
 ### ✅ **Modular Architecture**
-- **API/Core separation**: Clear contracts
-- **Dependency Inversion**: Depend on abstractions
-- **Plugin system**: Use modules independently
+- **Dependency Inversion**: Strict separation between `api` (contracts) and `core` (implementations).
+- **Plug-and-Play**: Modules (Mongo, Redis, View, etc.) can be used independently.
 
 ---
 
@@ -915,14 +1144,14 @@ public class OrderSearch implements Search {
     private List<OrderStatus> statuses;
     
     @SearchProperty(
-        value = "customer.email",
+        value = "c.email",
         isLike = true,
-        join = @Join(path = "customer", alias = "c")
+        join = @Join(value = "customer c", left = true)
     )
     private String customerEmail;
     
     @SearchProperties(
-        value = {"customer.firstName", "customer.lastName"},
+        value = {"c.firstName", "c.lastName"},
         isLike = true,
         conditionType = ConditionType.OR
     )
@@ -940,7 +1169,70 @@ public interface OrderRepository extends
 Page<Order> orders = orderRepository.search(search, PageRequest.of(0, 20));
 ```
 
-### Example 4: Redis with Distributed Lock
+### Example 4: Advanced JPA Search (SubSearch & Complex Joins)
+
+Shows complex querying with chained joins, sub-searches (nested logic), and string concatenation.
+
+```java
+@Data
+@SearchForClass(value = Booking.class, distinct = true)
+public class BookingSearch extends Search {
+
+    // Complex search on multiple fields with conditions
+    @SearchProperties({
+        @SearchProperty(
+            join = @Join("c.bookingPaxes p"),
+            preCondition = @PreCondition(condition = "p.isLeadPax = true"), // Only search lead pax
+            concat = @Concat({"p.name", "p.surname"}),                       // Search 'Name Surname'
+            isLike = true
+        ),
+        @SearchProperty("bookingReference"),
+        @SearchProperty(
+            join = @Join("c.bookingProductItems bp"), 
+            value = "bp.productName", 
+            isLike = true
+        )
+    })
+    private String searchText;
+
+    // Chained Joins: Booking -> ProductItems -> ServiceItems
+    @SearchProperty(
+        join = @Join("c.bookingProductItems bp JOIN bp.bookingServiceItems bi"),
+        value = "bi.startDate"
+    )
+    private Date eventDate;
+
+    // SubSearch: Groups these conditions with custom logic (e.g., OR)
+    // AND ( ... main search conditions ... ) AND ( ... companyOrSearch conditions ... )
+    @SubSearch
+    private BookingCompanyOrSearch companyOrSearch;
+}
+
+@Data
+public class BookingCompanyOrSearch extends Search {
+    
+    // This allows finding a booking if ANY of these company IDs match (OR logic)
+    
+    @SearchProperty(value = "promoterCompanyId", conditionType = ConditionType.OR)
+    private Integer promoterCompanyId;
+
+    @SearchProperty(
+        join = @Join("c.bookingProductItems bp JOIN bp.bookingServiceItems bi"),
+        value = "bi.providerCompanyId", 
+        conditionType = ConditionType.OR
+    )
+    private Integer providerCompanyId;
+
+    @SearchProperty(
+        join = @Join("c.bookingProductItems bp"),
+        value = "bp.sellerCompanyId", 
+        conditionType = ConditionType.OR
+    )
+    private Integer sellerCompanyId;
+}
+```
+
+### Example 5: Redis with Distributed Lock
 
 ```java
 @Service
