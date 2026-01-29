@@ -1293,8 +1293,8 @@ public class InventoryService {
 **Fernando Guardiola Ruiz**  
 Software Architect | Backend Specialist
 
-- GitHub: [@fguardiola](https://github.com/fguardiola)
-- LinkedIn: [Fernando Guardiola](https://www.linkedin.com/in/fernando-guardiola)
+- GitHub: [@fernandoguardiolaruiz](https://github.com/fernandoguardiolaruiz)
+- LinkedIn: [Fernando Guardiola](https://www.linkedin.com/in/fernando-guardiola-ruiz-3093868a/?originalSubdomain=es)
 
 ---
 
